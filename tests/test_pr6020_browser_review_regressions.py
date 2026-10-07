@@ -114,13 +114,10 @@ export function __pr6020StreamStateSmoke() {
     module_uri = module_path.as_uri()
     script = f"""
       globalThis.window = globalThis;
-      // Node 21+ ships a real (getter-only) `navigator` global of its own —
-      // a plain assignment throws "Cannot set property navigator ... which
-      // has only a getter" on Node 22 (CI), even though it's silently a
-      // no-op-turned-fresh-global on Node 20 (this repo's other test
-      // containers), which doesn't predefine it. defineProperty overrides
-      // either case.
-      Object.defineProperty(globalThis, "navigator", {{ value: {{ platform: "" }}, writable: true, configurable: true }});
+      Object.defineProperty(globalThis, 'navigator', {{
+        value: {{ platform: 'Linux' }},
+        configurable: true,
+      }});
       globalThis.addEventListener = () => {{}};
       globalThis.removeEventListener = () => {{}};
       globalThis.dispatchEvent = () => {{}};
@@ -505,10 +502,13 @@ def test_superseded_stream_cleanup_leaves_replacement_state_alone():
       function _setForegroundChatBusy() {{}}
       const window = {{}};
       const sessionModule = {{ getCurrentSessionId() {{ return 'session-1'; }} }};
+      let docFinalized = 0;
+      const documentModule = {{ streamDocFinalize() {{ docFinalized += 1; }} }};
       {state_and_stop}
       function runCleanup(abortCtrl, streamGeneration) {{
         const streamSessionId = 'session-1';
         const _sendState = {{ generation: streamGeneration, abortCtrl }};
+        const _streamSawDone = false;
         {finally_cleanup}
         return _ownsStreamState;
       }}
@@ -523,6 +523,7 @@ def test_superseded_stream_cleanup_leaves_replacement_state_alone():
       _pendingRunStops.set('session-1:2', newCtrl);
       const preRegOwns = runCleanup(oldCtrl, 1);
       const afterPreReg = {{
+        docFinalized,
         ownEntryRemoved: !_activeStreams.has('session-1'),
         replacementPendingKept: _pendingRunStops.has('session-1:2'),
         sessionKept: _streamSessionId === 'session-1',
@@ -531,6 +532,7 @@ def test_superseded_stream_cleanup_leaves_replacement_state_alone():
       _activeStreams.set('session-1', {{ abortCtrl: newCtrl, holder: null, lastActivity: 2 }});
       const postRegOwns = runCleanup(oldCtrl, 1);
       const afterPostReg = {{
+        docFinalized,
         replacementRegistrationKept: _activeStreams.has('session-1'),
         replacementPendingKept: _pendingRunStops.has('session-1:2'),
         sessionKept: _streamSessionId === 'session-1',
@@ -538,6 +540,7 @@ def test_superseded_stream_cleanup_leaves_replacement_state_alone():
       // Owner: the current-generation send cleans up normally.
       const ownerOwns = runCleanup(newCtrl, 2);
       const afterOwner = {{
+        docFinalized,
         registered: _activeStreams.has('session-1'),
         pendingKept: _pendingRunStops.has('session-1:2'),
         sessionCleared: _streamSessionId === null,
@@ -550,18 +553,22 @@ def test_superseded_stream_cleanup_leaves_replacement_state_alone():
     assert _run_node(script) == {
         "preRegOwns": False,
         "afterPreReg": {
+            # A superseded send must not finalize the replacement's document stream.
+            "docFinalized": 0,
             "ownEntryRemoved": True,
             "replacementPendingKept": True,
             "sessionKept": True,
         },
         "postRegOwns": False,
         "afterPostReg": {
+            "docFinalized": 0,
             "replacementRegistrationKept": True,
             "replacementPendingKept": True,
             "sessionKept": True,
         },
         "ownerOwns": True,
         "afterOwner": {
+            "docFinalized": 1,
             "registered": False,
             "pendingKept": False,
             "sessionCleared": True,
