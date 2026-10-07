@@ -33,6 +33,7 @@ synchronous statements — dynamic `import()` runs in program order, unlike a
 static `import` declaration.
 """
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -42,6 +43,17 @@ import pytest
 _REPO = Path(__file__).resolve().parents[1]
 _JS_DIR = _REPO / "static" / "js"
 _HAS_NODE = shutil.which("node") is not None
+
+
+def _versioned_js_uri(entry_js: Path, target_name: str) -> str:
+    """file:// URI for target_name with the same cache-busting query string
+    entry_js's own import of it uses. ES modules cache by full URL, so
+    importing 'ui.js' here while chat.js imports 'ui.js?v=X' yields two module
+    instances, and patching uiMod here would never reach chat.js."""
+    src = entry_js.read_text(encoding="utf-8")
+    m = re.search(rf"from ['\"]\./{re.escape(target_name)}(\?[^'\"]*)?['\"]", src)
+    suffix = (m.group(1) or "") if m else ""
+    return (entry_js.parent / target_name).resolve().as_uri() + suffix
 
 
 def _run_node(source: str) -> dict:
@@ -144,8 +156,8 @@ def _scenario_script(func_call_js: str, roles: list, target_index: int, confirm_
     script = _HARNESS_PREAMBLE
     script += f"""
       const chat = await import({json.dumps((_JS_DIR / "chat.js").resolve().as_uri())});
-      const {{ default: uiMod }} = await import({json.dumps((_JS_DIR / "ui.js").resolve().as_uri())});
-      const {{ default: sessionMod }} = await import({json.dumps((_JS_DIR / "sessions.js").resolve().as_uri())});
+      const {{ default: uiMod }} = await import({json.dumps(_versioned_js_uri(_JS_DIR / "chat.js", "ui.js"))});
+      const {{ default: sessionMod }} = await import({json.dumps(_versioned_js_uri(_JS_DIR / "chat.js", "sessions.js"))});
 
       sessionMod.getCurrentSessionId = () => 'test-session';
 
@@ -247,11 +259,28 @@ def test_resend_replace_from_here_cancel_aborts_without_truncating():
     assert result["truncateCalled"] is False
 
 
+# ---------------------------------------------------------------------------
+# resendUserMessage(el) with no options (footer "Resend message")
+# ---------------------------------------------------------------------------
+# `dev` made plain resend replace-by-default (see
+# test_resend_message_nondestructive.py): no options means replaceFromHere,
+# so the footer Resend button now truncates everything after the clicked
+# turn too, and gets the same warning. Append-only resend must be explicit.
+
 @pytest.mark.skipif(not _HAS_NODE, reason="node binary not on PATH")
-def test_resend_plain_never_truncates_or_prompts():
-    """Plain resend (no replaceFromHere) must stay non-destructive."""
+def test_resend_default_earlier_pair_prompts_with_correct_count():
+    roles = ["user", "ai", "user", "ai", "user", "ai"]
+    script = _scenario_script("chat.resendUserMessage(target)", roles, 0, confirm_resolution=True)
+    result = _run_node(script)
+    assert result["confirmShown"] is True
+    assert "4 messages" in result["confirmMessage"]
+    assert result["truncateCalled"] is True
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason="node binary not on PATH")
+def test_resend_append_only_never_truncates_or_prompts():
     roles = ["user", "ai", "user", "ai"]
-    script = _scenario_script("chat.resendUserMessage(target, {})", roles, 0, confirm_resolution=True)
+    script = _scenario_script("chat.resendUserMessage(target, { append: true })", roles, 0, confirm_resolution=True)
     result = _run_node(script)
     assert result["confirmShown"] is False
     assert result["truncateCalled"] is False
