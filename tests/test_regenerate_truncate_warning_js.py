@@ -1,13 +1,13 @@
 """Executable regression for the "regenerate" data-loss warning.
 
-Both `regenerateFrom` (the per-message ↻ footer button) and
-`resendUserMessage(..., { replaceFromHere: true })` (the vision editor's
-"Regenerate message" button) permanently delete every message after the
-point clicked via POST /api/session/{id}/truncate — a real, unrecoverable
-server-side delete. Clicking either on anything but the very last exchange
-used to do this with no warning at all; a mis-click could silently erase an
-entire conversation. This drives the real chat.js functions under Node,
-confirming:
+`regenerateFrom` (the per-message ↻ footer button), `resendUserMessage`
+(footer Resend and the vision editor's "Regenerate message" button) and
+`editUserMessage` (sending an edited user message) all permanently delete
+every message after the point clicked via POST /api/session/{id}/truncate —
+a real, unrecoverable server-side delete. Using any of them on anything but
+the very last exchange used to do this with no warning at all; a mis-click
+could silently erase an entire conversation. This drives the real chat.js
+functions under Node, confirming:
 
   1. Regenerating the *last* exchange (nothing after it) never prompts and
      truncates directly — the everyday case must not gain friction.
@@ -16,9 +16,12 @@ confirming:
   3. Cancelling the prompt aborts before any network call — nothing is
      deleted.
   4. Confirming the prompt proceeds with the correct `keep_count`.
+  5. Choosing "Fork from here" deletes nothing: it forks the chat just
+     before the user turn and replays the action (same text, or the edited
+     text) in the new chat instead.
 
-Both entry points (`regenerateFrom` and `resendUserMessage`) are exercised
-identically since they wrap the same destructive operation.
+All three entry points are exercised the same way since they wrap the same
+destructive operation.
 
 Unlike test_pr6020_browser_review_regressions.py's `_chat_smoke_source`
 (which appends extra code to a copy of chat.js's own source — fine for
@@ -87,7 +90,8 @@ _HARNESS_PREAMBLE = """
       const fetchCalls = [];
       globalThis.fetch = async (url, opts) => {
         fetchCalls.push({ url, body: opts && opts.body ? JSON.parse(opts.body) : null });
-        return { ok: true, json: async () => ({}), text: async () => '', headers: { get() { return null; } } };
+        const data = url.includes('/fork') ? { id: 'forked-session', name: 'Forked chat' } : {};
+        return { ok: true, json: async () => data, text: async () => '', headers: { get() { return null; } } };
       };
 
       class Element {
@@ -96,12 +100,22 @@ _HARNESS_PREAMBLE = """
           this.classList = { add() {}, remove() {}, toggle() {}, contains: () => false };
           this.style = { setProperty() {} };
           this.dataset = {};
+          this._listeners = {};
+          this._html = '';
         }
+        get innerHTML() { return this._html; }
+        set innerHTML(v) { this._html = v; this.children = []; }
         querySelector() { return null; }
         querySelectorAll() { return []; }
         appendChild(child) { this.children.push(child); return child; }
-        addEventListener() {}
+        addEventListener(type, fn) { (this._listeners[type] ||= []).push(fn); }
         removeEventListener() {}
+        focus() {}
+        // Fire a listener and wait for it — the edit Send handler is async.
+        fire(type) {
+          const ev = { stopPropagation() {}, preventDefault() {} };
+          return Promise.all((this._listeners[type] || []).map(fn => fn(ev)));
+        }
       }
       class HTMLInputElement extends Element {
         get value() { return this._value || ''; }
@@ -115,14 +129,19 @@ _HARNESS_PREAMBLE = """
       // resendUserMessage's own traversal (classList.contains, .dataset,
       // querySelector('.body'), querySelectorAll('[data-file-id]')).
       function buildMsgEls(msgs) {
-        return msgs.map((m, i) => ({
-          classList: { contains: (c) => c === (m === 'user' ? 'msg-user' : 'msg-ai') },
-          dataset: { raw: m === 'user' ? `question ${i}` : '' },
-          querySelector: (sel) => sel === '.body' ? { textContent: m === 'user' ? `question ${i}` : `answer ${i}`, innerHTML: `answer ${i}` } : null,
-          querySelectorAll: () => [],
-          nextSibling: null,
-          remove() {},
-        }));
+        return msgs.map((m, i) => {
+          const body = new Element();
+          body.textContent = m === 'user' ? `question ${i}` : `answer ${i}`;
+          body.innerHTML = body.textContent;
+          return {
+            classList: { contains: (c) => c === (m === 'user' ? 'msg-user' : 'msg-ai') },
+            dataset: { raw: m === 'user' ? `question ${i}` : '' },
+            querySelector: (sel) => sel === '.body' ? body : null,
+            querySelectorAll: () => [],
+            nextSibling: null,
+            remove() {},
+          };
+        });
       }
 
       const sendClicks = [];
@@ -148,7 +167,7 @@ _HARNESS_PREAMBLE = """
 """
 
 
-def _scenario_script(func_call_js: str, roles: list, target_index: int, confirm_resolution: bool) -> str:
+def _scenario_script(func_call_js: str, roles: list, target_index: int, confirm_resolution, then_js: str = "") -> str:
     # Globals are stubbed above as plain synchronous statements *before* the
     # dynamic import()s below run — unlike a static `import` declaration,
     # dynamic import() executes in program order, so chat.js's transitive
@@ -159,7 +178,11 @@ def _scenario_script(func_call_js: str, roles: list, target_index: int, confirm_
       const {{ default: uiMod }} = await import({json.dumps(_versioned_js_uri(_JS_DIR / "chat.js", "ui.js"))});
       const {{ default: sessionMod }} = await import({json.dumps(_versioned_js_uri(_JS_DIR / "chat.js", "sessions.js"))});
 
-      sessionMod.getCurrentSessionId = () => 'test-session';
+      let currentSession = 'test-session';
+      const selectedSessions = [];
+      sessionMod.getCurrentSessionId = () => currentSession;
+      sessionMod.loadSessions = async () => {{}};
+      sessionMod.selectSession = async (id) => {{ selectedSessions.push(id); currentSession = id; }};
 
       const confirmCalls = [];
       uiMod.styledConfirm = async (message, opts) => {{
@@ -175,12 +198,20 @@ def _scenario_script(func_call_js: str, roles: list, target_index: int, confirm_
       const target = msgs[{target_index}];
 
       await {func_call_js};
+      {then_js}
 
+      const forkCall = fetchCalls.find(c => c.url.includes('/fork'));
       console.log(JSON.stringify({{
         confirmShown: confirmCalls.length > 0,
         confirmMessage: confirmCalls.length ? confirmCalls[0].message : null,
+        confirmOpts: confirmCalls.length ? confirmCalls[0].opts : null,
         truncateCalled: fetchCalls.some(c => c.url.includes('/truncate')),
         truncateKeepCount: (fetchCalls.find(c => c.url.includes('/truncate')) || {{}}).body?.keep_count ?? null,
+        forkCalled: Boolean(forkCall),
+        forkUrl: forkCall ? forkCall.url : null,
+        forkKeepCount: forkCall ? forkCall.body.keep_count : null,
+        selectedSessions,
+        sendClicks,
       }}));
       process.exit(0);
     """
@@ -284,3 +315,90 @@ def test_resend_append_only_never_truncates_or_prompts():
     result = _run_node(script)
     assert result["confirmShown"] is False
     assert result["truncateCalled"] is False
+
+
+# ---------------------------------------------------------------------------
+# editUserMessage (✎ edit, then Send)
+# ---------------------------------------------------------------------------
+# The edit Send handler is wired up inside editUserMessage, so these open the
+# editor, type into it, and click the editor's own Send button.
+
+_EDIT_AND_SEND = """
+      const _body = target.querySelector('.body');
+      const [_editor, _btnRow] = _body.children;
+      _editor.value = 'edited question';
+      await _btnRow.children[0].fire('click');
+"""
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason="node binary not on PATH")
+def test_edit_last_message_skips_prompt_and_truncates():
+    roles = ["user", "ai"]
+    script = _scenario_script("chat.editUserMessage(target)", roles, 0, True, _EDIT_AND_SEND)
+    result = _run_node(script)
+    assert result["confirmShown"] is False
+    assert result["truncateCalled"] is True
+    assert result["truncateKeepCount"] == 0
+    assert result["sendClicks"] == ["edited question"]
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason="node binary not on PATH")
+def test_edit_earlier_message_prompts_with_correct_count():
+    roles = ["user", "ai", "user", "ai", "user", "ai"]  # target (index 2) has 2 messages after its own pair
+    script = _scenario_script("chat.editUserMessage(target)", roles, 2, True, _EDIT_AND_SEND)
+    result = _run_node(script)
+    assert result["confirmShown"] is True
+    assert "2 messages" in result["confirmMessage"]
+    assert result["confirmOpts"]["confirmText"] == "Delete and send"
+    assert result["truncateCalled"] is True
+    assert result["truncateKeepCount"] == 2
+    assert result["sendClicks"] == ["edited question"]
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason="node binary not on PATH")
+def test_edit_earlier_message_cancel_aborts_without_truncating_or_sending():
+    roles = ["user", "ai", "user", "ai"]
+    script = _scenario_script("chat.editUserMessage(target)", roles, 0, False, _EDIT_AND_SEND)
+    result = _run_node(script)
+    assert result["confirmShown"] is True
+    assert result["truncateCalled"] is False
+    assert result["sendClicks"] == []
+
+
+# ---------------------------------------------------------------------------
+# "Fork from here" — the prompt's alternate choice
+# ---------------------------------------------------------------------------
+# styledConfirm resolves to 'alternate' for its third button. Forking must
+# not truncate anything; it forks just before the user turn (so the new chat
+# ends where the action starts), switches to the fork, and replays there.
+
+def _assert_forked_instead(result, keep_count, sent_text):
+    assert result["confirmShown"] is True
+    assert result["confirmOpts"]["alternateText"] == "Fork from here"
+    assert result["truncateCalled"] is False
+    assert result["forkCalled"] is True
+    assert "/api/session/test-session/fork" in result["forkUrl"]
+    assert result["forkKeepCount"] == keep_count
+    assert result["selectedSessions"] == ["forked-session"]
+    assert result["sendClicks"] == [sent_text]
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason="node binary not on PATH")
+def test_regenerate_fork_choice_forks_before_user_turn_and_resends():
+    roles = ["user", "ai", "user", "ai", "user", "ai"]
+    script = _scenario_script("chat.regenerateFrom(target)", roles, 3, "alternate")
+    _assert_forked_instead(_run_node(script), keep_count=2, sent_text="question 2")
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason="node binary not on PATH")
+def test_resend_fork_choice_forks_before_user_turn_and_resends():
+    roles = ["user", "ai", "user", "ai", "user", "ai"]
+    script = _scenario_script("chat.resendUserMessage(target)", roles, 2, "alternate")
+    _assert_forked_instead(_run_node(script), keep_count=2, sent_text="question 2")
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason="node binary not on PATH")
+def test_edit_fork_choice_forks_before_user_turn_and_sends_edit():
+    roles = ["user", "ai", "user", "ai", "user", "ai"]
+    script = _scenario_script("chat.editUserMessage(target)", roles, 2, "alternate", _EDIT_AND_SEND)
+    _assert_forked_instead(_run_node(script), keep_count=2, sent_text="edited question")

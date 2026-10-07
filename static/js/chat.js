@@ -6939,6 +6939,29 @@ import { invalidateSettings } from './appConfig.js';
       const sessionId = sessionModule.getCurrentSessionId();
       if (!sessionId) return;
 
+      // Everything after the original reply to this message would also be
+      // destroyed. Cancelling leaves the editor open with the draft intact.
+      const extraCount = allMsgs.length - msgIndex - 2;
+      const choice = await _confirmTruncateIfDestructive(extraCount, 'edit');
+      if (!choice) return;
+      if (choice === 'fork') {
+        // Branch just before this user turn and send the edit there; this
+        // chat keeps the original message and everything after it.
+        bodyEl.innerHTML = originalHTML;
+        try {
+          await _forkSessionAt(msgIndex);
+        } catch (err) {
+          console.error('Fork failed:', err);
+          if (uiModule) uiModule.showError('Fork failed: ' + err.message);
+          return;
+        }
+        const forkInput = uiModule.el('message');
+        forkInput.value = newText;
+        const forkSubmit = document.querySelector('.send-btn');
+        if (forkSubmit) forkSubmit.click();
+        return;
+      }
+
       const keepCount = msgIndex;
       try {
         await fetch(`${API_BASE}/api/session/${sessionId}/truncate`, {
@@ -6975,29 +6998,57 @@ import { invalidateSettings } from './appConfig.js';
     });
   }
 
+  // Regenerate, resend and edit all permanently delete everything after the
+  // point clicked via POST /api/session/{id}/truncate — a real, unrecoverable
+  // server-side delete, not just a UI change. Acting on the most recent
+  // exchange (nothing exists after it) is the everyday case and shouldn't
+  // need a prompt; `extraCount` is 0 there. Anything earlier does: none of
+  // those buttons says it also erases the rest of the conversation. The
+  // prompt also offers to fork instead, which leaves this chat untouched and
+  // replays the action in a new chat branched at this point.
+  // Resolves to 'proceed', 'fork', or null (cancelled).
+  const _TRUNCATE_ACTIONS = {
+    regenerate: { lead: 'Regenerating here', confirmText: 'Delete and regenerate' },
+    resend: { lead: 'Resending this message', confirmText: 'Delete and resend' },
+    edit: { lead: 'Sending this edit', confirmText: 'Delete and send' },
+  };
+  async function _confirmTruncateIfDestructive(extraCount, action = 'regenerate') {
+    if (extraCount <= 0) return 'proceed';
+    const { lead, confirmText } = _TRUNCATE_ACTIONS[action] || _TRUNCATE_ACTIONS.regenerate;
+    const result = await uiModule.styledConfirm(
+      `${lead} will also permanently delete the ${extraCount} ` +
+      `message${extraCount === 1 ? '' : 's'} after it. This can't be undone. ` +
+      `Fork from here keeps this chat as it is and continues in a new one instead.`,
+      { confirmText, alternateText: 'Fork from here', cancelText: 'Cancel', danger: true }
+    );
+    if (result === 'alternate') return 'fork';
+    return result ? 'proceed' : null;
+  }
+
+  // Copy the first `keepCount` messages of the current chat into a new chat
+  // and switch to it. Returns the new session id; throws on failure so callers
+  // that replay an action in the fork can stop before sending anything.
+  async function _forkSessionAt(keepCount) {
+    const sessionId = sessionModule.getCurrentSessionId();
+    if (!sessionId) throw new Error('No active chat');
+    const res = await fetch(`${API_BASE}/api/session/${sessionId}/fork`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keep_count: keepCount }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    await sessionModule.loadSessions();
+    await sessionModule.selectSession(data.id);
+    if (uiModule) uiModule.showToast(`Forked → ${data.name}`);
+    return data.id;
+  }
+
   /**
    * Resend a user message. By default this replaces from the selected user turn
    * so failed attempts do not remain in model context or SFT traces. Callers can
    * opt into append-only behavior with `{ append: true }`.
    */
-  // Both "regenerate" flows below permanently delete everything after the
-  // point being regenerated via POST /api/session/{id}/truncate — a real,
-  // unrecoverable server-side delete, not just a UI change. Regenerating
-  // the most recent exchange (nothing exists after it) is the everyday
-  // case and shouldn't need a prompt; `extraCount` is 0 there. Anything
-  // earlier does: the button's own label ("Regenerate message") doesn't
-  // say it also erases the rest of the conversation, so a click anywhere
-  // but the very last exchange would otherwise do that silently, with no
-  // way to get it back.
-  async function _confirmTruncateIfDestructive(extraCount) {
-    if (extraCount <= 0) return true;
-    return uiModule.styledConfirm(
-      `Regenerating here will also permanently delete the ${extraCount} ` +
-      `message${extraCount === 1 ? '' : 's'} after it. This can't be undone.`,
-      { confirmText: 'Delete and regenerate', cancelText: 'Cancel', danger: true }
-    );
-  }
-
   export async function resendUserMessage(userMsgElement, opts = {}) {
     const appendOnly = Boolean(opts && opts.append);
     const replaceFromHere = !appendOnly || Boolean(opts && opts.replaceFromHere);
@@ -7052,7 +7103,19 @@ import { invalidateSettings } from './appConfig.js';
         // message would also be destroyed — that's the part a click on
         // Resend / "Regenerate message" doesn't expect to lose.
         const extraCount = allMsgs.length - msgIndex - 2;
-        if (!(await _confirmTruncateIfDestructive(extraCount))) return;
+        const choice = await _confirmTruncateIfDestructive(extraCount, 'resend');
+        if (!choice) return;
+        if (choice === 'fork') {
+          // Branch just before this user turn and send it again there; this
+          // chat keeps every message.
+          await _forkSessionAt(msgIndex);
+          _pendingRegenAttachments = _ids;
+          const forkInput = uiModule.el('message');
+          forkInput.value = text;
+          const forkSubmit = document.querySelector('.send-btn');
+          if (forkSubmit) forkSubmit.click();
+          return;
+        }
         // Resend/regenerate trims history to this point before resubmitting so
         // the replacement request is the only copy the backend sees.
         const keepCount = msgIndex;
@@ -7121,7 +7184,8 @@ import { invalidateSettings } from './appConfig.js';
     // be destroyed — that's the part a click on "Regenerate from here"
     // doesn't expect to lose.
     const extraCount = allMsgs.length - aiIndex - 1;
-    if (!(await _confirmTruncateIfDestructive(extraCount))) return;
+    const choice = await _confirmTruncateIfDestructive(extraCount, 'regenerate');
+    if (!choice) return;
 
     // Collect any file_ids attached to the original user message so the
     // regenerated send re-uses them. Without this the AI is regenerated on
@@ -7165,6 +7229,25 @@ import { invalidateSettings } from './appConfig.js';
 
     const sessionId = sessionModule.getCurrentSessionId();
     if (!sessionId) return;
+
+    if (choice === 'fork') {
+      // Branch just before the user turn and send it again there, so the new
+      // chat gets a fresh reply to the same message; this chat keeps every
+      // message. No variants or hidden bubble: the fork starts without them.
+      try {
+        await _forkSessionAt(userIndex);
+      } catch (err) {
+        _pendingRegenAttachments = null;
+        console.error('Fork failed:', err);
+        if (uiModule) uiModule.showError('Fork failed: ' + err.message);
+        return;
+      }
+      const forkInput = uiModule.el('message');
+      forkInput.value = userText;
+      const forkSubmit = document.querySelector('.send-btn');
+      if (forkSubmit) forkSubmit.click();
+      return;
+    }
 
     // Save current response as a variant
     const oldRaw = aiMsgElement.dataset.raw || aiMsgElement.querySelector('.body')?.textContent || '';
@@ -7356,20 +7439,8 @@ import { invalidateSettings } from './appConfig.js';
     const sessionId = sessionModule.getCurrentSessionId();
     if (!sessionId) return;
 
-    const keepCount = aiIndex + 1;
-
     try {
-      const res = await fetch(`${API_BASE}/api/session/${sessionId}/fork`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keep_count: keepCount }),
-      });
-      if (!res.ok) throw new Error(await res.text());
-      const data = await res.json();
-
-      await sessionModule.loadSessions();
-      await sessionModule.selectSession(data.id);
-      if (uiModule) uiModule.showToast(`Forked → ${data.name}`);
+      await _forkSessionAt(aiIndex + 1);
     } catch (err) {
       console.error('Fork failed:', err);
       if (uiModule) uiModule.showError('Fork failed: ' + err.message);
